@@ -89,6 +89,32 @@ def parse_args():
     parser.add_argument("--hidden_dropout_prob", default=0.5, type=float)
     parser.add_argument("--initializer_range", default=0.02, type=float)
     parser.add_argument("--fre", default=1.0, type=float)
+    parser.add_argument("--canonical_sbr_mode", action="store_true")
+    parser.add_argument("--train_path", default=None, type=str)
+    parser.add_argument("--valid_path", default=None, type=str)
+    parser.add_argument("--test_path", default=None, type=str)
+    parser.add_argument("--metadata_path", default=None, type=str)
+    parser.add_argument(
+        "--checkpoint_protocol",
+        choices=["fixed_epoch", "validation_best"],
+        default=None,
+    )
+    parser.add_argument(
+        "--validation_metric",
+        choices=["hr@20", "mrr@20", "ndcg@20"],
+        default="ndcg@20",
+    )
+    parser.add_argument(
+        "--metric_cutoffs",
+        nargs="+",
+        type=int,
+        default=[5, 10, 20],
+    )
+    parser.add_argument("--topk", type=int, default=20)
+    parser.add_argument("--prediction_output_path", default=None, type=str)
+    parser.add_argument("--checkpoint_output_path", default=None, type=str)
+    parser.add_argument("--epoch_metrics_output_path", default=None, type=str)
+    parser.add_argument("--per_epoch_prediction_dir", default=None, type=str)
 
     args, _ = parser.parse_known_args()
 
@@ -134,7 +160,54 @@ def parse_args():
     elif args.model_type.lower() == 'gru4rec':
         parser.add_argument("--gru_hidden_size", default=64, type=int, help="hidden size of GRU")
 
-    return parser.parse_args()
+    parsed = parser.parse_args()
+    if parsed.canonical_sbr_mode:
+        validate_canonical_args(parsed)
+    return parsed
+
+
+def validate_canonical_args(args):
+    required_paths = (
+        "train_path",
+        "valid_path",
+        "test_path",
+        "metadata_path",
+        "prediction_output_path",
+    )
+    missing = [name for name in required_paths if not getattr(args, name, None)]
+    if missing:
+        raise ValueError(
+            "Canonical SBR mode requires arguments: "
+            + ", ".join(f"--{name}" for name in missing)
+        )
+    if args.checkpoint_protocol is None:
+        raise ValueError(
+            "Canonical SBR mode requires explicit --checkpoint_protocol."
+        )
+    if args.model_type.lower() != "freqrec":
+        raise ValueError("Canonical SBR mode supports only --model_type freqrec.")
+    if args.epochs <= 0:
+        raise ValueError("Canonical SBR mode requires --epochs to be positive.")
+    if args.batch_size <= 0:
+        raise ValueError("Canonical SBR mode requires --batch_size to be positive.")
+    if args.num_workers < 0:
+        raise ValueError("Canonical SBR mode requires --num_workers to be non-negative.")
+    if args.max_seq_length <= 0:
+        raise ValueError(
+            "Canonical SBR mode requires --max_seq_length to be positive."
+        )
+    if args.topk <= 0:
+        raise ValueError("Canonical SBR mode requires --topk to be positive.")
+    if args.fre != 1.0:
+        raise ValueError("Canonical SBR mode requires --fre 1.0.")
+    if type(args.fourier_loss) is not bool or args.fourier_loss is not True:
+        raise ValueError(
+            "Canonical SBR mode requires the frequency loss to remain enabled. "
+            "Do not pass an ambiguous or disabled --fourier_loss value."
+        )
+    if not args.metric_cutoffs or any(cutoff <= 0 for cutoff in args.metric_cutoffs):
+        raise ValueError("Canonical metric cutoffs must be positive.")
+    args.metric_cutoffs = sorted(set(int(cutoff) for cutoff in args.metric_cutoffs) | {20})
 
 class EarlyStopping:
     """Early stops the training if validation loss doesn't improve after a given patience."""

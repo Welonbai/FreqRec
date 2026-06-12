@@ -29,3 +29,35 @@ def idcg_k(k):
         return 1.0
     else:
         return res
+
+
+def canonical_ranking_metrics(actual, predicted, cutoffs):
+    if len(actual) != len(predicted):
+        raise ValueError(
+            "actual and predicted must have the same number of canonical examples."
+        )
+    if not actual:
+        raise ValueError("Canonical metrics require at least one example.")
+
+    result = {}
+    for cutoff_value in cutoffs:
+        cutoff = int(cutoff_value)
+        if cutoff <= 0:
+            raise ValueError("Metric cutoffs must be positive.")
+        hit_sum = 0.0
+        reciprocal_rank_sum = 0.0
+        ndcg_sum = 0.0
+        for label, ranking in zip(actual, predicted):
+            try:
+                rank = list(ranking[:cutoff]).index(int(label)) + 1
+            except ValueError:
+                rank = 0
+            if rank > 0:
+                hit_sum += 1.0
+                reciprocal_rank_sum += 1.0 / rank
+                ndcg_sum += 1.0 / math.log(rank + 1, 2)
+        count = float(len(actual))
+        result[f"hr@{cutoff}"] = hit_sum / count
+        result[f"mrr@{cutoff}"] = reciprocal_rank_sum / count
+        result[f"ndcg@{cutoff}"] = ndcg_sum / count
+    return result

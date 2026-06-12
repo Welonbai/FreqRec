@@ -3,7 +3,7 @@ import torch
 import numpy as np
 
 from torch.optim import Adam
-from metrics import recall_at_k, ndcg_k
+from metrics import canonical_ranking_metrics, recall_at_k, ndcg_k
 import random
 class Trainer:
     def __init__(self, model, train_dataloader, eval_dataloader, test_dataloader, args, logger):
@@ -171,3 +171,159 @@ class Trainer:
                     answer_list = np.append(answer_list, answers.cpu().data.numpy(), axis=0)
 
             return self.get_full_sort_score(epoch, answer_list, pred_list)
+
+    def canonical_train_epoch(self, epoch):
+        self.model.train()
+        total_loss = 0.0
+        batch_count = 0
+        rec_data_iter = tqdm.tqdm(
+            enumerate(self.train_dataloader),
+            desc="Mode_train:%d" % epoch,
+            total=len(self.train_dataloader),
+            bar_format="{l_bar}{r_bar}",
+        )
+        for batch_index, batch in rec_data_iter:
+            batch = tuple(t.to(self.device) for t in batch)
+            example_ids, input_ids, answers, neg_answer, same_target = batch
+            loss = self.model.calculate_loss(
+                input_ids,
+                answers,
+                neg_answer,
+                same_target,
+                example_ids,
+            )
+            if not torch.isfinite(loss).all().item():
+                raise RuntimeError(
+                    "Canonical training produced a non-finite loss at "
+                    f"split=train, epoch {epoch + 1}, batch {batch_index + 1}/"
+                    f"{len(self.train_dataloader)}, "
+                    f"batch_example_count={input_ids.size(0)}."
+                )
+            self.optim.zero_grad()
+            loss.backward()
+            self.optim.step()
+            total_loss += float(loss.item())
+            batch_count += 1
+        if batch_count == 0:
+            raise RuntimeError("Canonical training loader produced no batches.")
+        average_loss = total_loss / batch_count
+        if (epoch + 1) % self.args.log_freq == 0:
+            self.logger.info(
+                str({"epoch": epoch, "rec_loss": "{:.4f}".format(average_loss)})
+            )
+        return average_loss
+
+    def canonical_evaluate(
+        self,
+        dataloader,
+        *,
+        evaluation_topk,
+        metric_cutoffs,
+        split="evaluation",
+        epoch=None,
+    ):
+        item_count = int(self.args.item_count)
+        ranking_depth = int(evaluation_topk)
+        if ranking_depth <= 0 or ranking_depth > item_count:
+            raise ValueError(
+                "evaluation_topk must be within the canonical item universe."
+            )
+        expected_count = len(dataloader.dataset)
+        indexed_rankings = [None] * expected_count
+        indexed_labels = [None] * expected_count
+        self.model.eval()
+        with torch.no_grad():
+            rec_data_iter = tqdm.tqdm(
+                enumerate(dataloader),
+                desc="Mode_canonical_eval",
+                total=len(dataloader),
+                bar_format="{l_bar}{r_bar}",
+            )
+            for batch_index, batch in rec_data_iter:
+                batch = tuple(t.to(self.device) for t in batch)
+                example_ids, input_ids, answers, _, _ = batch
+                recommend_output, _ = self.model.predict(input_ids, example_ids)
+                sequence_output = recommend_output[:, -1, :]
+                all_scores = self.predict_full(sequence_output)
+                if all_scores.size(1) < item_count + 1:
+                    raise RuntimeError(
+                        "FreqRec item embedding matrix is smaller than the canonical "
+                        "item universe."
+                    )
+                canonical_scores = all_scores[:, 1:item_count + 1]
+                finite_scores = torch.isfinite(canonical_scores)
+                if not finite_scores.all().item():
+                    non_finite_count = int((~finite_scores).sum().item())
+                    epoch_context = (
+                        "final"
+                        if epoch is None
+                        else str(int(epoch))
+                    )
+                    raise RuntimeError(
+                        "Canonical evaluation produced non-finite scores for "
+                        f"split={split}, epoch={epoch_context}, "
+                        f"batch={batch_index + 1}/{len(dataloader)}, "
+                        f"batch_example_count={input_ids.size(0)}, "
+                        f"non_finite_score_count={non_finite_count}."
+                    )
+                local_indices = torch.topk(
+                    canonical_scores,
+                    k=ranking_depth,
+                    dim=1,
+                    largest=True,
+                    sorted=True,
+                ).indices
+                canonical_ids = local_indices + 1
+
+                batch_ids = example_ids.detach().cpu().tolist()
+                batch_labels = answers.detach().cpu().tolist()
+                batch_rankings = canonical_ids.detach().cpu().tolist()
+                for example_id, label, ranking in zip(
+                    batch_ids,
+                    batch_labels,
+                    batch_rankings,
+                ):
+                    example_id = int(example_id)
+                    if example_id < 0 or example_id >= expected_count:
+                        raise RuntimeError(
+                            f"Canonical evaluation produced out-of-range example_id "
+                            f"{example_id}."
+                        )
+                    if indexed_rankings[example_id] is not None:
+                        raise RuntimeError(
+                            f"Canonical evaluation produced duplicate example_id "
+                            f"{example_id}."
+                        )
+                    normalized = [int(item) for item in ranking]
+                    if len(normalized) != ranking_depth:
+                        raise RuntimeError(
+                            f"Canonical ranking {example_id} has invalid length."
+                        )
+                    if len(set(normalized)) != ranking_depth:
+                        raise RuntimeError(
+                            f"Canonical ranking {example_id} contains duplicate items."
+                        )
+                    if any(item < 1 or item > item_count for item in normalized):
+                        raise RuntimeError(
+                            f"Canonical ranking {example_id} contains an invalid item ID."
+                        )
+                    indexed_rankings[example_id] = normalized
+                    indexed_labels[example_id] = int(label)
+
+        missing = [
+            index
+            for index, ranking in enumerate(indexed_rankings)
+            if ranking is None
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Canonical evaluation is missing example IDs: {missing[:10]}"
+            )
+        rankings = [ranking for ranking in indexed_rankings if ranking is not None]
+        labels = [label for label in indexed_labels if label is not None]
+        metrics = canonical_ranking_metrics(labels, rankings, metric_cutoffs)
+        return {
+            "rankings": rankings,
+            "labels": labels,
+            "metrics": metrics,
+        }

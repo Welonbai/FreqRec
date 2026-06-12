@@ -6,6 +6,8 @@ from scipy.sparse import csr_matrix
 from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
 import random
 
+from canonical_io import CanonicalRecord
+
 class RecDataset(Dataset):
     def __init__(self, args, user_seq, test_neg_items=None, data_type='train'):
         self.args = args
@@ -226,3 +228,63 @@ def get_dataloder(args,seq_dic,fre=1.0):
     test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size, num_workers=args.num_workers)
 
     return train_dataloader, eval_dataloader, test_dataloader
+
+
+class CanonicalRecDataset(Dataset):
+    def __init__(self, records, max_seq_length):
+        self.records = list(records)
+        self.max_seq_length = int(max_seq_length)
+        if self.max_seq_length <= 0:
+            raise ValueError("max_seq_length must be positive.")
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, index):
+        record = self.records[index]
+        if not isinstance(record, CanonicalRecord):
+            raise TypeError("CanonicalRecDataset requires CanonicalRecord values.")
+        input_ids = list(record.input_prefix[-self.max_seq_length:])
+        pad_len = self.max_seq_length - len(input_ids)
+        input_ids = ([0] * pad_len) + input_ids
+        return (
+            torch.tensor(record.example_id, dtype=torch.long),
+            torch.tensor(input_ids, dtype=torch.long),
+            torch.tensor(record.label, dtype=torch.long),
+            torch.zeros(0, dtype=torch.long),
+            torch.zeros(0, dtype=torch.long),
+        )
+
+
+def get_canonical_dataloaders(args, train_records, valid_records, test_records):
+    train_dataset = CanonicalRecDataset(train_records, args.max_seq_length)
+    valid_dataset = CanonicalRecDataset(valid_records, args.max_seq_length)
+    test_dataset = CanonicalRecDataset(test_records, args.max_seq_length)
+
+    generator = torch.Generator()
+    generator.manual_seed(int(args.seed))
+    train_sampler = RandomSampler(train_dataset, generator=generator)
+    valid_sampler = SequentialSampler(valid_dataset)
+    test_sampler = SequentialSampler(test_dataset)
+
+    loader_kwargs = {
+        "batch_size": int(args.batch_size),
+        "num_workers": int(args.num_workers),
+        "drop_last": False,
+    }
+    train_dataloader = DataLoader(
+        train_dataset,
+        sampler=train_sampler,
+        **loader_kwargs,
+    )
+    valid_dataloader = DataLoader(
+        valid_dataset,
+        sampler=valid_sampler,
+        **loader_kwargs,
+    )
+    test_dataloader = DataLoader(
+        test_dataset,
+        sampler=test_sampler,
+        **loader_kwargs,
+    )
+    return train_dataloader, valid_dataloader, test_dataloader
